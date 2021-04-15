@@ -25,8 +25,8 @@ library(googleLanguageR)
 stock_list_tbl <- tq_index("SP500") %>%
   select(symbol, company, weight) %>% 
   arrange(desc(weight))
-symbol <- stock_list_tbl$symbol[1:20]
-symbol <- symbol[-8]###I do not know how to extract data of BRK.B, so I just delete it.
+symbol <- stock_list_tbl$symbol[c(1:5)]
+###I do not know how to extract data of BRK.B, so I just delete it.
 stock_data <- tq_get(symbol, get = "stock.prices",
                      from = "2021-01-01",to= "2021-04-01")
 ```
@@ -67,14 +67,29 @@ get.ny <- function(a){
 }
 ```
 
-```{r, echo = TRUE}
-company.names <- stock_list_tbl$company[1:2]
+```{r echo=}
+company.names <- stock_list_tbl$company[c(1:7,9,10)]
 ny.data <- data.frame()
-for (i in as.factor(company.names)){
-  i.data <- get.ny(i)
-  ny.data <- rbind(ny.data,i.data)
-}
+ny.data <- rbind(ny.data,get.ny(company.names[1]))
+ny.data <- rbind(ny.data,get.ny(company.names[2]))
+ny.data <- rbind(ny.data,get.ny(company.names[3]))
+ny.data <- rbind(ny.data,get.ny(company.names[4]))
+ny.data <- rbind(ny.data,get.ny(company.names[7]))
+ny.data$response.docs.abstract
 data <- ny.data[-75,]
+```
+
+```{r, echo = TRUE, message=FALSE,warning = FALSE} 
+install.packages("sentimentr")
+library(sentimentr)
+sentiment.score <- c()
+for (i in 1:nrow(data)){
+  sa <- sentiment_by(data$response.docs.abstract[i])
+  sentiment.score <- c(sentiment.score, sa$ave_sentiment)
+}
+sentiment.score
+
+
 ```
 
 
@@ -85,6 +100,7 @@ if (!"devtools" %in% installed.packages()) {
 }
 devtools::install_github("mkearney/googleapis")
 library(googleapis)
+gl_auth("My First Project-d3965af63fb5.json")
 sentiment.score <- c()
 for (i in 1:nrow(data)){
   sa <- analyze_sentiment(data$response.docs.abstract[i])
@@ -92,6 +108,36 @@ for (i in 1:nrow(data)){
   sentiment.score <- c(sentiment.score, mean(sa$score))
 }
 sentiment.score
+
+data$response.docs.pub_date <- format(as.Date(data$response.docs.pub_date), "%Y-%m-%d")
+data <- cbind(data, sentiment.score)
+factor.data <- data %>% 
+  select(response.docs.pub_date, sentiment.score) %>% 
+  group_by(response.docs.pub_date) %>% 
+  summarise(mean(sentiment.score)) %>% 
+  arrange(response.docs.pub_date)
+colnames(factor.data) <- c("date", "sentiment.score")
+stock_data$date <- as.character(stock_data$date)
+factor.data$date <- as.character(factor.data$date)
+final.data <- left_join(stock_data, factor.data)
+final.data$sentiment.score[is.na(final.data$sentiment.score)] <- 0
+final.data
+
+```
+
+```{r, echo = TRUE}
+fit1 <- lm(data = final.data, close~open+high+low+sentiment.score)
+summary(fit1)
+summary.aov(fit1)
+
+price.change <- final.data$close-final.data$open
+final.data <- cbind(final.data, price.change)
+fit2 <- lm(data = final.data, price.change~sentiment.score+high+low)
+summary(fit2)
+summary.aov(fit2)
+
+
+
 
 ```
 
