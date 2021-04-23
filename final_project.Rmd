@@ -9,6 +9,7 @@ output: pdf_document
 #LIBRARIES
 library(quantmod)
 library(tidyquant)
+library(tibble)
 library(fs)
 library(jsonlite)
 library(httr)
@@ -24,25 +25,31 @@ library(recipes)
 library(Metrics)
 ```
 
-```{r, echo = TRUE, message=FALSE}
-#Final project
-##Extracting S&P500 data from the packages
-stock_list_tbl <- tq_index("SP500") %>%
-  select(symbol, company, weight) %>% 
-  arrange(desc(weight))
-symbol <- stock_list_tbl$symbol[c(1:5)]
-###I do not know how to extract data of BRK.B, so I just delete it.
-stock_data <- tq_get(symbol, get = "stock.prices",
-                     from = "2015-01-01",to= "2021-04-01")
-```
 
-```{r, echo = TRUE} 
-stock_data <- stock_data %>% 
-  select(symbol, date, close)
-```
+```{r}
+# FUNCTION DEFINITIONS
+calc_rmse <- function(finalized_df){
+  duplicate.locs <- duplicated(finalized_df$date) | duplicated(finalized_df$date,fromLast=TRUE)
+  
+  duplicates <- finalized_df[duplicate.locs,]
+  
+  actuals <- duplicates %>%
+    group_split(key) %>%
+    .[[1]] %>%
+    .['close'] %>%
+    unlist(use.names = FALSE)
+  
+  predictions <- duplicates %>%
+    group_split(key) %>%
+    .[[2]] %>%
+    .['close'] %>%
+    unlist(use.names = FALSE)
+  
+  rmse_val <- Metrics::rmse(actuals,predictions)
+  
+  return(round(rmse_val,2))
+}
 
-```{r, echo = TRUE} 
-### Extract New York Times data
 get.ny <- function(a){
   NYTIMES_KEY = "LXrkrR8vlr0RnqKwoA7we3dyCngAdEPk"
   
@@ -68,6 +75,131 @@ get.ny <- function(a){
   allNYTSearch <- rbind_pages(pages)
   return(allNYTSearch)
 }
+
+fit_LSTM_to_split <- function(split,keras.model,lag_setting,batch_size,train_length,tsteps_input,
+                              epochs_input){
+  
+  lag.setting <- lag_setting # nrow(first.split.testing)
+  batch.size <- batch_size 
+  train.length <- train_length
+  tsteps <- tsteps_input
+  epochs <- epochs_input
+  
+  split.training <- split %>%
+    training() %>%
+    add_column(key = "Training")
+
+  split.testing <- split %>%
+    testing() %>%
+    add_column(key = "Testing")
+
+  overall.split <- bind_rows(split.training,split.testing)
+  
+  p1 <- ggplot(data=overall.split,aes(date,close,color=key)) +
+    geom_point() + 
+    labs(title = "Testing and Training Data First Split",
+         x = "Time",
+         y = "Closing Price (in US $)") + 
+    theme_classic() + 
+    theme(legend.position = "bottom",legend.title = element_blank())
+  
+  rec_obj <- recipe(close ~ .,overall.split) %>%
+    step_center(close) %>%
+    step_scale(close) %>%
+    prep()
+  
+  centered.data <- bake(rec_obj,overall.split)
+  
+  original.center <- rec_obj$steps[[1]]$means["close"]
+  original.deviation <- rec_obj$steps[[2]]$sds["close"]
+  
+  lag_train_tbl <- centered.data %>%
+    mutate(close_lag = lag(close,n = lag.setting)) %>%
+    filter(!is.na(close_lag)) %>%
+    filter(key == "Training") %>%
+    tail(train.length)
+  
+  x_train_vec <- lag_train_tbl$close_lag
+  x_train_arr <- array(data=x_train_vec,dim=c(length(x_train_vec),tsteps,1))
+  
+  y_train_vec <- lag_train_tbl$close
+  y_train_arr <- array(data = y_train_vec, dim=c(length(y_train_vec),tsteps,1))
+  
+  lag_test_tbl <- centered.data %>%
+    mutate(close_lag = lag(close,n = lag.setting)) %>%
+    filter(!is.na(close_lag)) %>%
+    filter(key == "Testing")
+  
+  x_test_vec <- lag_test_tbl$close_lag
+  x_test_arr <- array(data=x_test_vec,dim=c(length(x_test_vec),tsteps,1))
+  
+  y_test_vec <- lag_test_tbl$close
+  y_test_arr <- array(data=y_test_vec,dim=c(length(y_test_vec),tsteps,1))
+  
+  for (i in 1:epochs) {
+    keras.model %>% fit(x=x_train_arr,
+                  y=y_train_arr,
+                  batch_size=batch.size,
+                  epochs=1,
+                  verbose=1,
+                  shuffle=FALSE)
+    
+    keras.model %>% reset_states()
+    cat("Epoch: ",i)
+  }
+  
+  ## Execute predictions on the test set
+  closing_pred <- model %>%
+    predict(x_test_arr, batch_size = batch.size) %>%
+    .[,1] %>%
+    as_tibble() %>%
+    mutate(s1=value*original.deviation,.keep="unused") %>%
+    mutate(close = s1+original.center,.keep = "unused") %>%
+    cbind("date"=lag_test_tbl$date) %>%
+    add_column(key="Prediction")
+  
+  ## Combine predictions with original split values to create overall set.
+  final.data.set <- overall.split %>%
+    select(date,close,key) %>%
+    mutate(key = "Actual",.keep = "unused") %>%
+    bind_rows(closing_pred)
+  
+  rmse_evaluation <- calc_rmse(final.data.set)
+  
+  ## Calcualte the RMSE between predictions, 
+  ## Plot the results
+  p2 <- ggplot(data=final.data.set,aes(date,close,color=key)) +
+    geom_point(alpha = 0.5) +
+    scale_color_manual(values = c("black","red")) + 
+    labs(title = paste0("Closing Price Time Series with RMSE: ",rmse_evaluation),
+         x = "Time",
+         y = "Closing Price") + 
+    theme_classic() + 
+    theme(legend.title = element_blank())  
+  
+  p2
+  
+  return(list(rmse_evaluation,p1,p2))
+}
+
+```
+
+
+```{r, echo = TRUE, message=FALSE}
+#Final project
+##Extracting S&P500 data from the packages
+stock_list_tbl <- tq_index("SP500") %>%
+  select(symbol, company, weight) %>% 
+  arrange(desc(weight))
+symbol <- stock_list_tbl$symbol[c(1:5)]
+###I do not know how to extract data of BRK.B, so I just delete it.
+stock_data <- tq_get(symbol, get = "stock.prices",
+                     from = "2014-01-01",to= "2021-03-31")
+```
+
+```{r, echo = TRUE} 
+stock_data <- stock_data %>% 
+  select(symbol, date, close)
 ```
 
 ```{r echo=}
@@ -77,7 +209,7 @@ ny.data <- rbind(ny.data,get.ny(company.names[1]))
 ny.data <- rbind(ny.data,get.ny(company.names[2]))
 ny.data <- rbind(ny.data,get.ny(company.names[3]))
 ny.data <- rbind(ny.data,get.ny(company.names[4]))
-ny.data <- rbind(ny.data,get.ny(company.names[5]))
+# ny.data <- rbind(ny.data,get.ny(company.names[5]))
 
 ```
 
@@ -90,7 +222,8 @@ for (i in 1:nrow(data)){
 sentiment.score
 ```
 
-Chunk which evaluates aapl stock price using LSTM RNN
+Chunk which evaluates aapl stock price using LSTM RNN.
+
 ```{r}
 ## Isolate the apple stock closing price
 aapl.data <- stock_data %>%
@@ -100,9 +233,9 @@ aapl.data <- stock_data %>%
 ## Create 4 splits to evaluate LSTM RNN separately to get sense of how well model performs
 ## across different samples (avoid inferring too much from single result)
 
-training.period <- 262
-testing.period <- 131
-skip.span <- 262+131
+training.period <- 720
+testing.period <- 180
+skip.span <- 180
 
 backtest.splits <- rolling_origin(
   aapl.data,
@@ -112,86 +245,13 @@ backtest.splits <- rolling_origin(
   skip = skip.span
 )
 
-## Visualize the first split as check
-first.split.training <- backtest.splits$splits[[1]] %>%
-  training() %>%
-  add_column(key = "Training")
-
-first.split.testing <- backtest.splits$splits[[1]] %>%
-  testing() %>%
-  add_column(key = "Testing")
-
-overall.split <- bind_rows(first.split.training,first.split.testing)
-
-p <- ggplot(data=overall.split,aes(date,close,color=key)) +
-  geom_point() + 
-  labs(title = "Testing and Training Data First Split",
-       x = "Time",
-       y = "Closing Price (in US $)") + 
-  theme_classic() + 
-  theme(legend.position = "bottom",legend.title = element_blank())
-
-p
-
-```
-
-Now, fit Keras LSTM to this split. Center and scale the data.
-
-```{r}
-## Perform centering, scaling with R recipe.
-rec_obj <- recipe(close ~ .,overall.split) %>%
-  step_center(close) %>%
-  step_scale(close) %>%
-  prep()
-
-centered.data <- bake(rec_obj,overall.split)
-
-head(centered.data,10)
-```
-
-
-
-```{r}
-lag_train_tbl <- centered.data %>%
-  mutate(close_lag = lag(close,n = lag.setting)) %>%
-  filter(!is.na(close_lag)) %>%
-  filter(key == "Training") %>%
-  tail(train.length)
-
-x_train_vec <- lag_train_tbl$close_lag
-x_train_arr <- array(data=x_train_vec,dim=c(length(x_train_vec),tsteps,1))
-
-y_train_vec <- lag_train_tbl$close
-y_train_arr <- array(data = y_train_vec, dim=c(length(y_train_vec),tsteps,1))
-
-lag_test_tbl <- centered.data %>%
-  mutate(close_lag = lag(close,n = lag.setting)) %>%
-  filter(!is.na(close_lag)) %>%
-  filter(key == "Testing")
-
-x_test_vec <- lag_test_tbl$close_lag
-x_test_arr <- array(data=x_test_vec,dim=c(length(x_test_vec),tsteps,1))
-
-y_test_vec <- lag_test_tbl$close
-y_test_arr <- array(data=y_test_vec,dim=c(length(y_test_vec),tsteps,1))
-
-```
-
-
-
-```{r}
 ## LSTM parameters
-lag.setting <- 131 # nrow(first.split.testing)
-batch.size <- 131 
-train.length <- 262
+lag.setting <- 90 # nrow(first.split.testing)
+batch.size <- 180 
+train.length <- 540
 tsteps <- 1
-epochs <- 300
-```
+epochs <- 400
 
-
-
-```{r}
-## Initializing model
 model <- keras_model_sequential()
 
 model %>%
@@ -206,88 +266,22 @@ model %>%
   layer_dense(units = 1)
 
 model %>%
-  compile(loss = 'mae',optimizer = 'adam')
+  compile(loss = 'mse',optimizer = 'adam')
 
-model
-
-```
-
-
-```{r}
-## Fitting the model
-for (i in 1:epochs) {
-  model %>% fit(x=x_train_arr,
-                y=y_train_arr,
-                batch_size=batch.size,
-                epochs=1,
-                verbose=1,
-                shuffle=FALSE)
-  
-  model %>% reset_states()
-  cat("Epoch: ",i)
-}
+splitty <- backtest.splits$splits[[3]]
+output <- fit_LSTM_to_split(splitty,model,
+                        lag.setting,
+                        batch.size,
+                        train.length,
+                        tsteps,
+                        epochs)
+## To visualize plot, call the 3rd element of the list
+output[[3]]
 
 ```
 
-```{r}
-## Evaluating model results
-original.center <- rec_obj$steps[[1]]$means["close"]
-original.deviation <- rec_obj$steps[[2]]$sds["close"]
-
-## Execute predictions on the test set
-closing_pred <- model %>%
-  predict(x_test_arr, batch_size = batch.size) %>%
-  .[,1] %>%
-  as_tibble() %>%
-  mutate(s1=value*original.deviation,.keep="unused") %>%
-  mutate(close = s1+original.center,.keep = "unused") %>%
-  cbind("date"=lag_test_tbl$date) %>%
-  add_column(key="Prediction")
-
-## Combine predictions with original split values to create overall set.
-final.data.set <- overall.split %>%
-  select(date,close,key) %>%
-  mutate(key = "Actual",.keep = "unused") %>%
-  bind_rows(closing_pred)
-
-calc_rmse <- function(finalized_df){
-  duplicate.locs <- duplicated(finalized_df$date) | duplicated(finalized_df$date,fromLast=TRUE)
-  
-  duplicates <- finalized_df[duplicate.locs,]
-  
-  actuals <- duplicates %>%
-    group_split(key) %>%
-    .[[1]] %>%
-    .['close'] %>%
-    unlist(use.names = FALSE)
-  
-  predictions <- duplicates %>%
-    group_split(key) %>%
-    .[[2]] %>%
-    .['close'] %>%
-    unlist(use.names = FALSE)
-  
-  rmse_val <- Metrics::rmse(actuals,predictions)
-  
-  return(rmse_val)
-}
-
-rmse_evaluation <- calc_rmse(final.data.set)
-
-## Calcualte the RMSE between predictions, 
-## Plot the results
-p2 <- ggplot(data=final.data.set,aes(date,close,color=key)) +
-  geom_point(alpha = 0.5) +
-  scale_color_manual(values = c("black","red")) + 
-  labs(title = paste0("Closing Price Time Series with RMSE: ",rmse_evaluation),
-       x = "Time",
-       y = "Closing Price") + 
-  theme_classic() + 
-  theme(legend.title = element_blank())  
 
 
-p2
-```
 
 
 
