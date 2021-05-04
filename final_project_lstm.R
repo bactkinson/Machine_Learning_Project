@@ -467,7 +467,7 @@ multi.model %>%
   layer_dense(units = 1)
 
 multi.model %>%
-  compile(loss = 'mae',optimizer = 'adam')
+  compile(loss = 'mse',optimizer = 'adam')
 
 multi.model.output <- fit_LSTM_to_multistocks(new.splits$splits[[6]],
                             multi.model,
@@ -481,6 +481,7 @@ multi.model.output <- fit_LSTM_to_multistocks(new.splits$splits[[6]],
 multi.model.output[[2]]
 
 split.sequestered <- backtest.splits$splits[[6]]
+
 output <- fit_LSTM_to_singlestock(split.sequestered,
                                   model,
                                   lag.setting,
@@ -490,3 +491,41 @@ output <- fit_LSTM_to_singlestock(split.sequestered,
                                   epochs)
 # To visualize plot, call the 3rd element of the list
 output[[3]]
+
+# special_tanh <- function(x)
+# {
+#   return(tanh(x*10))
+# }
+# 
+# lag.setting <- c(1,2,3,90) # nrow(first.split.testing)
+# batch.size <- 30 # both testing.period/batch.size and train.length/batch.size whole nums
+# train.length <- 630
+# tsteps <- 4
+# epochs <- 200
+# strange.model <- keras_model_sequential()
+# 
+# strange.model %>%
+#   layer_lstm(units = 50,
+#              input_shape = c(tsteps,1),
+#              batch_size = batch.size,
+#              return_sequences = TRUE,
+#              stateful = TRUE) %>%
+#   layer_activation("custom_activation") %>%
+#   layer_lstm(units = 50,
+#              return_sequences = FALSE,
+#              stateful = TRUE) %>%
+#   layer_dense(units = 1)
+# 
+# strange.model %>%
+#   compile(loss = 'mae',optimizer = 'adam')
+# 
+# strange.output <- fit_LSTM_to_singlestock(split.sequestered,
+#                                   strange.model,
+#                                   lag.setting,
+#                                   batch.size,
+#                                   train.length,
+#                                   tsteps,
+#                                   epochs)
+# 
+# strange.output[[3]]
+# 
