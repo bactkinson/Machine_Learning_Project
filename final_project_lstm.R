@@ -287,6 +287,46 @@ fit_LSTM_to_multistocks <- function(split,keras_model,lag_setting,batch_size,tra
 
   return(list(rmse_evaluation,p2))
 }
+ts.predict <- function(data){
+  # Compute the returns for the stock
+  stock = data
+  stock = stock[!is.na(stock)]
+  breakpoint = floor(nrow(stock)*(2.9/3))
+  
+  # Initialzing a dataframe for the forecasted return series
+  model.parameter <- arimaorder(auto.arima(stock, lambda = "auto"))
+  p <- as.numeric(model.parameter[1])
+  d <- as.numeric(model.parameter[2])
+  q <- as.numeric(model.parameter[3])
+  forecasted_series <- c()
+  for (b in breakpoint:(nrow(stock)-1)) {
+    stock_train = stock[1:b,]
+    
+    # Summary of the ARIMA model using the determined (p,d,q) parameters
+    fit = arima(stock_train, order = c(p, d, q),include.mean=TRUE, optim.control = list(maxit = 1000))
+    arima.forecast = forecast(fit, h = 1,level=99)
+    # Creating a series of forecasted returns for the forecasted period
+    forecasted_series = c(forecasted_series,arima.forecast$mean[1])
+  }
+  y <- stock[(floor(nrow(stock)*(2.9/3))+1):nrow(stock),]
+  g <- cbind(y,forecasted_series)
+  p1 <- plot(g, main = paste(names(data)))
+  for (i in 1:(nrow(g)-1)){
+    g$difference.actual[i] <- as.numeric(g[,1][i+1])-as.numeric(g[,1][i])
+    g$difference.predict[i] <- as.numeric(g[,2][i+1])-as.numeric(g[,2][i])
+  }
+  tf <- c()
+  for (i in 1:nrow(g)){
+    if (sign(g$difference.actual[i]) == sign(g$difference.predict[i])){
+      tf[i] = 1
+    } else{
+      tf[i] = 0
+    }
+  }
+  Accuracy.percentage <- sum(tf)/length(tf)*100
+  rmse.value <- rmse(g$difference.actual, g$difference.predict)
+  return(list(p1,Accuracy.percentage,rmse.value))
+}
 #Final project
 ##Extracting S&P500 data from the packages
 stock_list_tbl <- tq_index("SP500") %>%
@@ -432,3 +472,48 @@ weighted.output <- fit_LSTM_to_multistocks(all.splits$splits[[1]],
 weighted.output[[2]] +
   labs(subtitle = "With weighted loss function and dropout rate increased")
 
+### calculate Accuracy Percentage 
+# a <- output[[4]]
+# b <- a[a$key == "Actual",]
+# c <- a[a$key == "Prediction",]
+# colnames(c)[2] <- "Prediction.close"
+# d <- merge(x= b,y = c,by = "date", all.x = TRUE)
+# e <- d[!is.na(d$Prediction.close),]
+# g <- cbind(e$close,e$Prediction.close)
+# g <- as.data.frame(g)
+# for (i in 1:(nrow(g)-1)){
+#     g$difference.actual[i] <- as.numeric(g[,1][i+1])-as.numeric(g[,1][i])
+#     g$difference.predict[i] <- as.numeric(g[,2][i+1])-as.numeric(g[,2][i])
+# }
+# tf <- c()
+# for (i in 1:nrow(g)){
+#     if (sign(g$difference.actual[i]) == sign(g$difference.predict[i])){
+#       tf[i] = 1
+#     } else{
+#       tf[i] = 0
+#     }
+#   }
+# Accuracy.percentage <- sum(tf)/length(tf)*100
+
+
+###Time series prediction
+getSymbols('AAPL', from = "2014-01-01",to= "2021-03-31")
+getSymbols('MSFT', from = "2014-01-01",to= "2021-03-31")
+getSymbols('AMZN', from = "2014-01-01",to= "2021-03-31")
+getSymbols('FB', from = "2014-01-01",to= "2021-03-31")
+getSymbols('GOOG', from = "2014-01-01",to= "2021-03-31")
+aapl <- AAPL[,4]
+msft <- MSFT[,4]
+amzn <- AMZN[,4]
+fb <- FB[,4]
+goog <- GOOG[,4]
+
+a <- ts.predict(aapl)
+b <- ts.predict(msft)
+c <- ts.predict(amzn)
+d <- ts.predict(fb)
+e <- ts.predict(goog)
+
+par(mfrow=c(2,1))
+a[[1]]
+b[[1]]
