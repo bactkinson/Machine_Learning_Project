@@ -10,14 +10,13 @@ library(XML)
 library(rvest)
 library(ggplot2)
 library(dplyr)
-library(googleLanguageR)
-library(sentimentr)
 library(keras)
 library(rsample)
 library(recipes)
 library(Metrics)
 library(glue)
 library(tidyr)
+library(tensorflow)
 # FUNCTION DEFINITIONS
 calc_rmse <- function(finalized_df){
   duplicate.locs <- duplicated(finalized_df$date) | duplicated(finalized_df$date,fromLast=TRUE)
@@ -41,32 +40,6 @@ calc_rmse <- function(finalized_df){
   return(round(rmse_val,2))
 }
 
-get.ny <- function(a){
-  NYTIMES_KEY = "LXrkrR8vlr0RnqKwoA7we3dyCngAdEPk"
-  
-  x <- fromJSON(paste0("http://api.nytimes.com/svc/search/v2/articlesearch.json?q=",a,"&api-key=LXrkrR8vlr0RnqKwoA7we3dyCngAdEPk", sep=""), flatten = TRUE) %>% data.frame()
-  
-  list(name = c("persons", "organizations", "subject"), value = c("Stock"), rank = 1:3, major = c("N", "N", "N"))
-  # Need to use + to string together separate words
-  begin_date <- "20190101"
-  end_date <- "20210401"
-  baseurl <- paste0("http://api.nytimes.com/svc/search/v2/articlesearch.json?q=",a,
-                    "&begin_date=",begin_date,"&end_date=",end_date,
-                    "&facet_filter=true&api-key=",NYTIMES_KEY, sep="")
-  
-  initialQuery <- fromJSON(baseurl)
-  maxPages <- round((initialQuery$response$meta$hits[1] / 10)-1) 
-  pages <- list()
-  for(i in 0:3){
-    nytSearch <- fromJSON(paste0(baseurl, "&page=", i), flatten = TRUE) %>% data.frame() 
-    message("Retrieving page ", i)
-    pages[[i+1]] <- nytSearch 
-    Sys.sleep(10) 
-  }
-  allNYTSearch <- rbind_pages(pages)
-  return(allNYTSearch)
-}
-
 create_lstm_tbl <- function(input.data,lag.vec,stock.name,key.type,...){
   lag.vec <- sort(lag.vec,decreasing = FALSE)
   
@@ -81,6 +54,11 @@ create_lstm_tbl <- function(input.data,lag.vec,stock.name,key.type,...){
     filter(key==key.type) %>%
     {if(key.type=="Training") tail(.,...[[1]]) else .}
   return(lstm_tbl)
+}
+
+weighted_mse <- function( y_true, y_pred ) {
+  K <- backend()
+  K$mean(K$square(K.weights*(K$tanh(y_true)-K$tanh(y_pred))))
 }
 
 fit_LSTM_to_singlestock <- function(split,keras_model,lag_setting,batch_size,train_length,tsteps_input,
@@ -302,14 +280,11 @@ fit_LSTM_to_multistocks <- function(split,keras_model,lag_setting,batch_size,tra
     geom_point(alpha = 0.5) +
     scale_color_manual(values = c("black","red")) + 
     labs(title = paste0("Closing Price Time Series with RMSE: ",rmse_evaluation),
-         subtitle = "With 4 Tech Stocks as Additional Predictors",
          x = "Time",
          y = "Closing Price") + 
     theme_classic() + 
     theme(legend.title = element_blank())  
-  
-  p2
-  
+
   return(list(rmse_evaluation,p2))
 }
 #Final project
@@ -321,29 +296,10 @@ stock_list_tbl <- tq_index("SP500") %>%
 symbol <- stock_list_tbl$symbol[c(1:5)]
 
 stock_data <- tq_get(symbol, get = "stock.prices",
-                     from = "2014-01-01",to= "2021-03-31")
+                     from = "2014-01-01",to= "2021-04-01")
 
 stock_data <- stock_data %>% 
   select(symbol, date, close)
-
-# company.names <- stock_list_tbl$company[c(1:5)]
-# ny.data <- data.frame()
-# ny.data <- rbind(ny.data,get.ny(company.names[1]))
-# ny.data <- rbind(ny.data,get.ny(company.names[2]))
-# ny.data <- rbind(ny.data,get.ny(company.names[3]))
-# ny.data <- rbind(ny.data,get.ny(company.names[4]))
-# ny.data <- rbind(ny.data,get.ny(company.names[5]))
-
-
-
-
-# sentiment.score <- c()
-# for (i in 1:nrow(data)){
-#   sa <- sentiment_by(data$response.docs.abstract[i])
-#   sentiment.score <- c(sentiment.score, sa$ave_sentiment)
-# }
-# sentiment.score
-
 
 ## Isolate the apple stock closing price
 aapl.data <- stock_data %>%
@@ -352,107 +308,64 @@ aapl.data <- stock_data %>%
 
 spread_data <- stock_data %>%
   spread(.,symbol,close)
-## Create 4 splits to evaluate LSTM RNN separately to get sense of how well model performs
-## across different samples (avoid inferring too much from single result)
 
-training.period <- 720
-testing.period <- 180
-skip.span <- 180
+acf(aapl.data$close,lag.max=1500,main="Apple Close Price ACF")
+abline(v=90,col="blue")
 
-backtest.splits <- rolling_origin(
+## Fitting model to entirety of AAPL time series data
+
+training.period <- round(0.70*nrow(aapl.data),0)
+testing.period <- nrow(aapl.data)-training.period
+
+aapl.partitioning <- rolling_origin(
   aapl.data,
   initial = training.period,
   assess = testing.period,
-  cumulative = FALSE,
-  skip = skip.span
 )
 
 ## LSTM parameters
 lag.setting <- c(1,2,3,90) # nrow(first.split.testing)
-batch.size <- 30 # both testing.period/batch.size and train.length/batch.size whole nums
-train.length <- 630
+batch.size <- testing.period # both testing.period/batch.size and train.length/batch.size whole nums
+train.length <- testing.period*2
 tsteps <- 4
 epochs <- 200
-# 
-model <- keras_model_sequential()
 
-model %>%
+new.model <- keras_model_sequential()
+
+new.model %>%
   layer_lstm(units = 50,
              input_shape = c(tsteps,1),
              batch_size = batch.size,
              return_sequences = TRUE,
              stateful = TRUE) %>%
+  layer_dropout(0.3) %>%
   layer_lstm(units = 50,
              return_sequences = FALSE,
              stateful = TRUE) %>%
   layer_dense(units = 1)
 
-model %>%
-  compile(loss = 'mae',optimizer = 'adam')
- 
+new.model %>%
+  compile(loss = 'mse',optimizer = 'adam')
 
+aapl.output <- fit_LSTM_to_singlestock(aapl.partitioning$splits[[1]],
+                            new.model,
+                            lag.setting,
+                            batch.size,
+                            train.length,
+                            tsteps,
+                            epochs)
 
-## Try fitting model to entire aapl time series data
-
-# training.period <- round(0.70*nrow(aapl.data),0)
-# testing.period <- nrow(aapl.data)-training.period
-# 
-# 
-# entire.partitioning <- rolling_origin(
-#   aapl.data,
-#   initial = training.period,
-#   assess = testing.period,
-# )
-# 
-# ## LSTM parameters
-# lag.setting <- c(1,2,3,90) # nrow(first.split.testing)
-# batch.size <- testing.period # both testing.period/batch.size and train.length/batch.size whole nums
-# train.length <- testing.period*2
-# tsteps <- 4
-# epochs <- 200
-# 
-# new.model <- keras_model_sequential()
-# 
-# new.model %>%
-#   layer_lstm(units = 50,
-#              input_shape = c(tsteps,1),
-#              batch_size = batch.size,
-#              return_sequences = TRUE,
-#              stateful = TRUE) %>%
-#   layer_lstm(units = 50,
-#              return_sequences = FALSE,
-#              stateful = TRUE) %>%
-#   layer_dense(units = 1)
-# 
-# new.model %>%
-#   compile(loss = 'mse',optimizer = 'adam')
-# 
-# entire.output <- fit_LSTM_to_singlestock(entire.partitioning$splits[[1]],
-#                             new.model,
-#                             lag.setting,
-#                             batch.size,
-#                             train.length,
-#                             tsteps,
-#                             epochs)
-# 
-# entire.output[[3]]
+aapl.output[[3]]
 
 ## Incorporating multiple features
-new.splits <- rolling_origin(
+all.splits <- rolling_origin(
   spread_data,
   initial = training.period,
   assess = testing.period,
-  cumulative = FALSE,
-  skip = skip.span
 )
 
-lag.setting <- c(1,2,3,90) # nrow(first.split.testing)
-batch.size <- 30 # both testing.period/batch.size and train.length/batch.size whole nums
-train.length <- 630
-tsteps <- 4
-epochs <- 200
 num.features <- ncol(spread_data)-1
-# 
+ 
 multi.model <- keras_model_sequential()
 
 multi.model %>%
@@ -461,6 +374,7 @@ multi.model %>%
              batch_size = batch.size,
              return_sequences = TRUE,
              stateful = TRUE) %>%
+  layer_dropout(0.3) %>%
   layer_lstm(units = 50,
              return_sequences = FALSE,
              stateful = TRUE) %>%
@@ -469,7 +383,7 @@ multi.model %>%
 multi.model %>%
   compile(loss = 'mse',optimizer = 'adam')
 
-multi.model.output <- fit_LSTM_to_multistocks(new.splits$splits[[6]],
+multi.model.output <- fit_LSTM_to_multistocks(all.splits$splits[[1]],
                             multi.model,
                             lag.setting,
                             batch.size,
@@ -478,54 +392,43 @@ multi.model.output <- fit_LSTM_to_multistocks(new.splits$splits[[6]],
                             tsteps,
                             epochs)
 
-multi.model.output[[2]]
+multi.model.output[[2]] + 
+  labs(subtitle = "With 4 Tech Stocks as Additional Predictors")
+# 
+multi.model.output[[2]] +
+  geom_line() +
+  coord_cartesian(xlim=c(date("2020-12-31"),date("2021-04-01")),ylim=c(110,145))
 
-split.sequestered <- backtest.splits$splits[[6]]
+weighted.model <- keras_model_sequential()
 
-output <- fit_LSTM_to_singlestock(split.sequestered,
-                                  model,
+K.weights <- tf$Variable(c(1:547/547),tf$float32)
+
+weighted.model %>%
+  layer_lstm(units = 50,
+             input_shape = c(tsteps,num.features),
+             batch_size = batch.size,
+             activation = "tanh",
+             return_sequences = TRUE,
+             stateful = TRUE) %>%
+  layer_dropout(0.5) %>%
+  layer_lstm(units = 50,
+             activation = "tanh",
+             return_sequences = FALSE,
+             stateful = TRUE) %>%
+  layer_dense(units = 1)
+
+weighted.model %>%
+  compile(loss = weighted_mse,optimizer = 'adam')
+
+weighted.output <- fit_LSTM_to_multistocks(all.splits$splits[[1]],
+                                  weighted.model,
                                   lag.setting,
                                   batch.size,
                                   train.length,
+                                  num.features,
                                   tsteps,
                                   epochs)
-# To visualize plot, call the 3rd element of the list
-output[[3]]
 
-# special_tanh <- function(x)
-# {
-#   return(tanh(x*10))
-# }
-# 
-# lag.setting <- c(1,2,3,90) # nrow(first.split.testing)
-# batch.size <- 30 # both testing.period/batch.size and train.length/batch.size whole nums
-# train.length <- 630
-# tsteps <- 4
-# epochs <- 200
-# strange.model <- keras_model_sequential()
-# 
-# strange.model %>%
-#   layer_lstm(units = 50,
-#              input_shape = c(tsteps,1),
-#              batch_size = batch.size,
-#              return_sequences = TRUE,
-#              stateful = TRUE) %>%
-#   layer_activation("custom_activation") %>%
-#   layer_lstm(units = 50,
-#              return_sequences = FALSE,
-#              stateful = TRUE) %>%
-#   layer_dense(units = 1)
-# 
-# strange.model %>%
-#   compile(loss = 'mae',optimizer = 'adam')
-# 
-# strange.output <- fit_LSTM_to_singlestock(split.sequestered,
-#                                   strange.model,
-#                                   lag.setting,
-#                                   batch.size,
-#                                   train.length,
-#                                   tsteps,
-#                                   epochs)
-# 
-# strange.output[[3]]
-# 
+weighted.output[[2]] +
+  labs(subtitle = "With weighted loss function and dropout rate increased")
+
